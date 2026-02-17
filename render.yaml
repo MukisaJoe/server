@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: loveapp-sync-server
+    runtime: node
+    rootDir: server/sync-server
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /readyz
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: loveapp
+      - key: SYNC_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: LOG_LEVEL
+        value: info
