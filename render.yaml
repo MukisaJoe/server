@@ -2,7 +2,7 @@ services:
   - type: web
     name: loveapp-sync-server
     runtime: node
-    rootDir: server/sync-server
+    rootDir: .
     plan: starter
     buildCommand: npm ci
     startCommand: npm start
