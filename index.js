@@ -43,6 +43,8 @@ let spacesCollection;
 let logsCollection;
 let mediaCollection;
 let accountsCollection;
+let dbReady = false;
+let lastDbError = null;
 
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -244,12 +246,30 @@ app.get('/healthz', (_req, res) => {
 
 app.get('/readyz', async (_req, res) => {
   try {
+    if (!dbReady || !db) {
+      return res.status(503).json({
+        ok: false,
+        ready: false,
+        reason: lastDbError || 'db_not_connected',
+      });
+    }
     await db.command({ ping: 1 });
     return res.status(200).json({ ok: true, ready: true });
   } catch (error) {
     logger.error({ err: error }, 'readiness check failed');
     return res.status(503).json({ ok: false, ready: false });
   }
+});
+
+app.use((req, res, next) => {
+  if (req.path === '/healthz' || req.path === '/readyz') return next();
+  if (!dbReady) {
+    return res.status(503).json({
+      error: 'database not ready',
+      details: lastDbError || 'mongodb connection pending',
+    });
+  }
+  return next();
 });
 
 app.get('/calendar/templates', (_req, res) => {
@@ -594,7 +614,7 @@ app.get('/insights/mood/:spaceId', async (req, res) => {
   }
 });
 
-async function start() {
+async function connectDb() {
   await client.connect();
   db = client.db(dbName);
   spacesCollection = db.collection('sync_spaces');
@@ -607,10 +627,32 @@ async function start() {
   await mediaCollection.createIndex({ spaceId: 1, createdAt: -1 });
   await accountsCollection.createIndex({ accountName: 1 }, { unique: true });
   await accountsCollection.createIndex({ accountId: 1 }, { unique: true });
+}
 
+async function connectDbWithRetry() {
+  let delayMs = 3000;
+  while (!dbReady) {
+    try {
+      await connectDb();
+      dbReady = true;
+      lastDbError = null;
+      logger.info('MongoDB connection established');
+      return;
+    } catch (error) {
+      dbReady = false;
+      lastDbError = error?.message || String(error);
+      logger.error({ err: error, delayMs }, 'mongodb connect failed, retrying');
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(delayMs * 2, 60000);
+    }
+  }
+}
+
+async function start() {
   app.listen(port, () => {
     logger.info(`Sync server running on ${port}`);
   });
+  await connectDbWithRetry();
 }
 
 start().catch((error) => {
