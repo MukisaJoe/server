@@ -43,6 +43,7 @@ let spacesCollection;
 let logsCollection;
 let mediaCollection;
 let accountsCollection;
+let callsCollection;
 let dbReady = false;
 let lastDbError = null;
 
@@ -614,6 +615,218 @@ app.get('/insights/mood/:spaceId', async (req, res) => {
   }
 });
 
+// ============================================================
+// WebRTC Signaling Endpoints for Voice/Video Calls
+// ============================================================
+
+// Create a call offer (initiator sends SDP offer)
+app.post('/call/offer', async (req, res) => {
+  try {
+    const { callId, callerId, callerName, targetAccountId, callType, sdpOffer } = req.body || {};
+    if (!callId || !callerId || !targetAccountId || !sdpOffer) {
+      return res.status(400).json({ error: 'callId, callerId, targetAccountId, and sdpOffer are required' });
+    }
+
+    const now = Date.now();
+    await callsCollection.updateOne(
+      { callId },
+      {
+        $set: {
+          callId,
+          callerId,
+          callerName: callerName || 'Unknown',
+          targetAccountId,
+          callType: callType || 'voice',
+          sdpOffer,
+          sdpAnswer: null,
+          callerIceCandidates: [],
+          answererIceCandidates: [],
+          status: 'pending',
+          createdAt: now,
+          updatedAt: now,
+          expiresAt: now + 60000, // 60 second timeout for unanswered calls
+        },
+      },
+      { upsert: true },
+    );
+
+    return res.status(201).json({ ok: true, callId, status: 'pending' });
+  } catch (error) {
+    logger.error({ err: error }, 'call offer failed');
+    return res.status(500).json({ error: 'call offer failed' });
+  }
+});
+
+// Answer a call (recipient sends SDP answer)
+app.post('/call/answer', async (req, res) => {
+  try {
+    const { callId, answererId, sdpAnswer } = req.body || {};
+    if (!callId || !answererId || !sdpAnswer) {
+      return res.status(400).json({ error: 'callId, answererId, and sdpAnswer are required' });
+    }
+
+    const call = await callsCollection.findOne({ callId });
+    if (!call) {
+      return res.status(404).json({ error: 'call not found' });
+    }
+
+    if (call.status !== 'pending') {
+      return res.status(409).json({ error: 'call is no longer pending' });
+    }
+
+    await callsCollection.updateOne(
+      { callId },
+      {
+        $set: {
+          answererId,
+          sdpAnswer,
+          status: 'connected',
+          updatedAt: Date.now(),
+        },
+      },
+    );
+
+    return res.json({ ok: true, callId, status: 'connected' });
+  } catch (error) {
+    logger.error({ err: error }, 'call answer failed');
+    return res.status(500).json({ error: 'call answer failed' });
+  }
+});
+
+// Add ICE candidate
+app.post('/call/ice', async (req, res) => {
+  try {
+    const { callId, accountId, candidate } = req.body || {};
+    if (!callId || !accountId || !candidate) {
+      return res.status(400).json({ error: 'callId, accountId, and candidate are required' });
+    }
+
+    const call = await callsCollection.findOne({ callId });
+    if (!call) {
+      return res.status(404).json({ error: 'call not found' });
+    }
+
+    const isCaller = call.callerId === accountId;
+    const updateField = isCaller ? 'callerIceCandidates' : 'answererIceCandidates';
+
+    await callsCollection.updateOne(
+      { callId },
+      {
+        $push: { [updateField]: candidate },
+        $set: { updatedAt: Date.now() },
+      },
+    );
+
+    return res.json({ ok: true });
+  } catch (error) {
+    logger.error({ err: error }, 'ice candidate failed');
+    return res.status(500).json({ error: 'ice candidate failed' });
+  }
+});
+
+// Check for pending incoming calls
+app.get('/call/pending/:accountId', async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    const now = Date.now();
+
+    // Clean up expired calls
+    await callsCollection.deleteMany({ expiresAt: { $lt: now }, status: 'pending' });
+
+    const pendingCall = await callsCollection.findOne({
+      targetAccountId: accountId,
+      status: 'pending',
+      expiresAt: { $gt: now },
+    });
+
+    if (!pendingCall) {
+      return res.json({ ok: true, hasPendingCall: false });
+    }
+
+    return res.json({
+      ok: true,
+      hasPendingCall: true,
+      call: {
+        callId: pendingCall.callId,
+        callerId: pendingCall.callerId,
+        callerName: pendingCall.callerName,
+        callType: pendingCall.callType,
+        sdpOffer: pendingCall.sdpOffer,
+        callerIceCandidates: pendingCall.callerIceCandidates || [],
+      },
+    });
+  } catch (error) {
+    logger.error({ err: error }, 'pending call check failed');
+    return res.status(500).json({ error: 'pending call check failed' });
+  }
+});
+
+// Get call status and details (for polling connection state)
+app.get('/call/:callId', async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const { accountId } = req.query;
+
+    const call = await callsCollection.findOne({ callId });
+    if (!call) {
+      return res.status(404).json({ error: 'call not found' });
+    }
+
+    const isCaller = call.callerId === accountId;
+
+    return res.json({
+      ok: true,
+      callId: call.callId,
+      status: call.status,
+      callType: call.callType,
+      sdpOffer: isCaller ? null : call.sdpOffer,
+      sdpAnswer: isCaller ? call.sdpAnswer : null,
+      iceCandidates: isCaller ? call.answererIceCandidates : call.callerIceCandidates,
+      callerName: call.callerName,
+    });
+  } catch (error) {
+    logger.error({ err: error }, 'get call failed');
+    return res.status(500).json({ error: 'get call failed' });
+  }
+});
+
+// End a call
+app.delete('/call/:callId', async (req, res) => {
+  try {
+    const { callId } = req.params;
+
+    await callsCollection.updateOne(
+      { callId },
+      { $set: { status: 'ended', updatedAt: Date.now() } },
+    );
+
+    return res.json({ ok: true, callId, status: 'ended' });
+  } catch (error) {
+    logger.error({ err: error }, 'end call failed');
+    return res.status(500).json({ error: 'end call failed' });
+  }
+});
+
+// Decline/reject a call
+app.post('/call/decline', async (req, res) => {
+  try {
+    const { callId } = req.body || {};
+    if (!callId) {
+      return res.status(400).json({ error: 'callId is required' });
+    }
+
+    await callsCollection.updateOne(
+      { callId },
+      { $set: { status: 'declined', updatedAt: Date.now() } },
+    );
+
+    return res.json({ ok: true, callId, status: 'declined' });
+  } catch (error) {
+    logger.error({ err: error }, 'decline call failed');
+    return res.status(500).json({ error: 'decline call failed' });
+  }
+});
+
 async function connectDb() {
   await client.connect();
   db = client.db(dbName);
@@ -621,12 +834,16 @@ async function connectDb() {
   logsCollection = db.collection('client_logs');
   mediaCollection = db.collection('media_assets');
   accountsCollection = db.collection('accounts');
+  callsCollection = db.collection('webrtc_calls');
 
   await spacesCollection.createIndex({ spaceId: 1 }, { unique: true });
   await logsCollection.createIndex({ spaceId: 1, createdAt: -1 });
   await mediaCollection.createIndex({ spaceId: 1, createdAt: -1 });
   await accountsCollection.createIndex({ accountName: 1 }, { unique: true });
   await accountsCollection.createIndex({ accountId: 1 }, { unique: true });
+  await callsCollection.createIndex({ callId: 1 }, { unique: true });
+  await callsCollection.createIndex({ targetAccountId: 1, status: 1 });
+  await callsCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 }
 
 async function connectDbWithRetry() {
